@@ -72,6 +72,55 @@ class CompatibilityRequest(BaseModel):
     new_version: str = Field(min_length=1, max_length=64)
 
 
+class FixtureExpectField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    # omitted -> the field must simply be present; null -> expect a field
+    # without a raw value (hex/ascii).
+    raw_value: Optional[Any] = None
+
+
+class FixtureExpectBranch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field: str
+    matched: Optional[bool] = None
+    action: Optional[str] = None
+
+
+class FixtureExpectation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Each section is optional; supplied entries assert a subset of the
+    # baseline that is captured from the referenced version at creation time.
+    fields: Optional[List[FixtureExpectField]] = None
+    branch_path: Optional[List[FixtureExpectBranch]] = None
+    checksum_valid: Optional[bool] = None
+
+
+class FixtureCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+    device_type: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=64)
+    hex: str = Field(min_length=2)
+    # Optional assertions against the captured baseline; the full captured
+    # snapshot is always what gets persisted and compared against on a run.
+    expect: Optional[FixtureExpectation] = None
+
+
+class FixtureRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # required to disambiguate the name (names are unique within a device
+    # type, not globally)
+    device_type: str = Field(min_length=1, max_length=128)
+    # omitted -> re-run against the fixture's baseline version.
+    target_version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
 def validate_definition(defn: DefinitionCreate) -> None:
     """Cross-field semantic validation. Raises ValueError on problems."""
     if not defn.fields:

@@ -4,17 +4,20 @@ import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import database
 from .analyzer import CompatibilityError, analyze_compatibility
 from .encoder import EncodeError, encode_message
+from .fixtures import capture_snapshot, compare_snapshots, verify_expectation
 from .parser import ParseError, parse_message
 from .schemas import (
     CompatibilityRequest,
     DefinitionCreate,
     DetectRequest,
     EncodeRequest,
+    FixtureCreate,
+    FixtureRunRequest,
     ParseRequest,
     validate_definition,
 )
@@ -322,4 +325,192 @@ def encode(req: EncodeRequest):
         "version": record["version"],
         "definition_active": record["active"],
         **result,
+    }
+
+
+# ------------------------------------------------------------ fixtures (回归) --
+
+
+@app.post("/api/v1/fixtures", status_code=201)
+def create_fixture(req: FixtureCreate):
+    """Save a named parse-regression fixture.
+
+    The fixture name is unique within a device type. The hex payload is parsed
+    once against the referenced version and the resulting field snapshot
+    (field names + raw_value, branch path, checksum result) is stored as the
+    baseline. An optional ``expect`` block asserts fields/branches/checksum of
+    that baseline at creation time; the full captured snapshot is persisted
+    regardless and used by ``/run``.
+    """
+    record = database.get_definition(req.device_type, req.version)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"definition '{req.device_type}' version '{req.version}' not found",
+        )
+
+    data = _decode_hex(req.hex)
+    try:
+        result = parse_message(record["fields"], record["checksum"], data)
+    except ParseError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"baseline parse failed for fixture '{req.name}': {exc}",
+        )
+
+    snapshot = capture_snapshot(result)
+    if req.expect is not None:
+        problems = verify_expectation(
+            req.expect.model_dump(exclude_none=True), snapshot
+        )
+        if problems:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "fixture expectation does not match baseline", "problems": problems},
+            )
+
+    saved = database.create_fixture(
+        device_type=req.device_type,
+        name=req.name,
+        version=req.version,
+        hex_payload=req.hex,
+        snapshot=snapshot,
+    )
+    if saved is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"fixture '{req.name}' already exists for device type '{req.device_type}'",
+        )
+    return saved
+
+
+@app.get("/api/v1/fixtures")
+def list_fixtures(device_type: Optional[str] = Query(default=None)):
+    """List saved regression fixtures (optionally filtered by device type)."""
+    items = database.list_fixtures(device_type)
+    return {"count": len(items), "items": items}
+
+
+@app.get("/api/v1/fixtures/{name}")
+def get_fixture(name: str, device_type: Optional[str] = Query(default=None)):
+    """Get a fixture by name. Names are unique only within a device type:
+    pass ``?device_type=...`` to disambiguate, otherwise a name shared by
+    several device types returns 409 with the candidates."""
+    if device_type is not None:
+        fixture = database.get_fixture(device_type, name)
+        if fixture is None:
+            raise HTTPException(status_code=404, detail=f"fixture '{name}' not found")
+        return fixture
+
+    matches = database.get_fixture_by_name(name)
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"fixture '{name}' not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"fixture name '{name}' matches multiple device types",
+                "candidates": [
+                    {"device_type": m["device_type"], "version": m["version"]} for m in matches
+                ],
+            },
+        )
+    return matches[0]
+
+
+@app.delete("/api/v1/fixtures/{name}", status_code=204)
+def delete_fixture(name: str, device_type: Optional[str] = Query(default=None)):
+    """Delete a fixture (same disambiguation rule as GET)."""
+    if device_type is not None:
+        if not database.delete_fixture(device_type, name):
+            raise HTTPException(status_code=404, detail=f"fixture '{name}' not found")
+        return Response(status_code=204)
+
+    matches = database.get_fixture_by_name(name)
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"fixture '{name}' not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"fixture name '{name}' matches multiple device types",
+                "candidates": [
+                    {"device_type": m["device_type"], "version": m["version"]} for m in matches
+                ],
+            },
+        )
+    database.delete_fixture(matches[0]["device_type"], name)
+    return Response(status_code=204)
+
+
+@app.post("/api/v1/fixtures/{name}/run")
+def run_fixture(name: str, req: FixtureRunRequest):
+    """Re-run a saved fixture against a parser version and compare with its
+    baseline snapshot.
+
+    The body carries the fixture's ``device_type`` (names are unique only
+    within a device type) and an optional ``target_version`` (defaults to the
+    fixture's baseline version). The payload is parsed against the target
+    definition and compared field-by-field: field names with ``raw_value``,
+    the conditional branch path, and the checksum validation result. Version
+    changes surface as ``added``/``removed``/``changed`` sets plus a pass
+    rate; a target version that fails to parse is reported per item (HTTP 200
+    with ``parse_error``), never as a 5xx crash.
+    """
+    fixture = database.get_fixture(req.device_type, name)
+    if fixture is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"fixture '{name}' not found for device type '{req.device_type}'",
+        )
+
+    target_version = req.target_version or fixture["version"]
+    target = database.get_definition(fixture["device_type"], target_version)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"definition '{fixture['device_type']}' version '{target_version}' not found",
+        )
+
+    data = _decode_hex(fixture["hex"])
+
+    actual_snapshot = None
+    parse_error: Optional[str] = None
+    target_checksum_cfg = target["checksum"]
+    try:
+        result = parse_message(target["fields"], target_checksum_cfg, data)
+    except ParseError as exc:
+        # Keep the regression report: every baseline item becomes a failure.
+        parse_error = str(exc)
+        actual_snapshot = {
+            "fields": [],
+            "branch_path": [],
+            "checksum_valid": None,
+        }
+    else:
+        actual_snapshot = capture_snapshot(result)
+
+    comparison = compare_snapshots(fixture["snapshot"], actual_snapshot)
+    if parse_error is not None:
+        comparison["errors"].insert(0, f"target parse failed: {parse_error}")
+        # A failed parse cannot validate even a checksum-free definition.
+        if comparison["checksum"]["passed"]:
+            comparison["checksum"]["passed"] = False
+            comparison["passed_checks"] -= 1
+            comparison["pass_rate"] = round(
+                comparison["passed_checks"] / comparison["total_checks"], 4
+            )
+
+    return {
+        "name": name,
+        "device_type": fixture["device_type"],
+        "baseline_version": fixture["version"],
+        "target_version": target_version,
+        "version_changed": target_version != fixture["version"],
+        "hex": fixture["hex"],
+        "baseline": fixture["snapshot"],
+        "actual": actual_snapshot,
+        "comparison": comparison,
+        "parse_error": parse_error,
+        "passed": parse_error is None and comparison["passed"],
     }

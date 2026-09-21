@@ -19,6 +19,17 @@ CREATE TABLE IF NOT EXISTS definitions (
     created_at  TEXT    NOT NULL,
     UNIQUE (device_type, version)
 );
+
+CREATE TABLE IF NOT EXISTS fixtures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_type TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    version     TEXT    NOT NULL,
+    hex         TEXT    NOT NULL,
+    snapshot    TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL,
+    UNIQUE (device_type, name)
+);
 """
 
 
@@ -129,3 +140,80 @@ def deactivate(device_type: str, version: str) -> Optional[Dict[str, Any]]:
     if cursor.rowcount == 0:
         return None
     return get_definition(device_type, version)
+
+
+# ------------------------------------------------------------------ fixtures --
+
+
+def _fixture_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "device_type": row["device_type"],
+        "name": row["name"],
+        "version": row["version"],
+        "hex": row["hex"],
+        "snapshot": json.loads(row["snapshot"]),
+        "created_at": row["created_at"],
+    }
+
+
+def create_fixture(
+    device_type: str,
+    name: str,
+    version: str,
+    hex_payload: str,
+    snapshot: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Returns the created fixture, or None if (device_type, name) already exists."""
+    snapshot_json = json.dumps(snapshot)
+    created_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO fixtures (device_type, name, version, hex, snapshot, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (device_type, name, version, hex_payload, snapshot_json, created_at),
+            )
+    except sqlite3.IntegrityError:
+        return None
+    return get_fixture(device_type, name)
+
+
+def get_fixture(device_type: str, name: str) -> Optional[Dict[str, Any]]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM fixtures WHERE device_type = ? AND name = ?",
+            (device_type, name),
+        ).fetchone()
+    return _fixture_row_to_dict(row) if row else None
+
+
+def get_fixture_by_name(name: str) -> List[Dict[str, Any]]:
+    """Look up a fixture by name across device types (names are only unique
+    *within* a device type)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM fixtures WHERE name = ? ORDER BY device_type, created_at",
+            (name,),
+        ).fetchall()
+    return [_fixture_row_to_dict(r) for r in rows]
+
+
+def list_fixtures(device_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    query = "SELECT * FROM fixtures"
+    params: List[Any] = []
+    if device_type:
+        query += " WHERE device_type = ?"
+        params.append(device_type)
+    query += " ORDER BY device_type, created_at"
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_fixture_row_to_dict(r) for r in rows]
+
+
+def delete_fixture(device_type: str, name: str) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM fixtures WHERE device_type = ? AND name = ?",
+            (device_type, name),
+        )
+    return cursor.rowcount > 0

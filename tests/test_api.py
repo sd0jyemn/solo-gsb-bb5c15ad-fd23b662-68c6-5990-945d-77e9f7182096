@@ -1373,3 +1373,531 @@ def test_compatibility_rejects_repeat_definitions_422():
     resp = _compat("array_dev", "3.0.0", "1.0.0")
     assert resp.status_code == 422
     assert "repeated" in resp.json()["detail"]
+
+
+# ------------------------------------------------------- regression fixtures --
+
+
+# v1: 4-byte body + crc16; v2: 5-byte body + crc16 (v1 cannot parse v2 messages)
+FIX_SENSOR_V1 = {
+    "device_type": "fix_sensor",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 8},
+        {"name": "temperature", "type": "int", "bit_length": 16},
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+FIX_SENSOR_V2 = {
+    "device_type": "fix_sensor",
+    "version": "2.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 8},
+        {"name": "temperature", "type": "int", "bit_length": 32},
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+# identical layout across versions, only endianness changes -> parses on both,
+# but raw_value changes
+FIX_METER_V1 = {
+    "device_type": "fix_meter",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "kind", "type": "uint", "bit_length": 8},
+        {"name": "value", "type": "uint", "bit_length": 16, "endianness": "big"},
+    ],
+}
+FIX_METER_V2 = dict(FIX_METER_V1, version="2.0.0")
+FIX_METER_V2 = {
+    "device_type": "fix_meter",
+    "version": "2.0.0",
+    "fields": [
+        {"name": "kind", "type": "uint", "bit_length": 8},
+        {"name": "value", "type": "uint", "bit_length": 16, "endianness": "little"},
+    ],
+}
+
+# branches change between versions
+FIX_BRANCH_V1 = {
+    "device_type": "fix_branch",
+    "version": "1.0.0",
+    "fields": [
+        {"name": "kind", "type": "uint", "bit_length": 8},
+        {
+            "name": "alarm",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "kind", "op": "eq", "value": 1},
+        },
+    ],
+}
+FIX_BRANCH_V2 = {
+    "device_type": "fix_branch",
+    "version": "2.0.0",
+    "fields": [
+        {"name": "kind", "type": "uint", "bit_length": 8},
+        {
+            "name": "alarm",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "kind", "op": "eq", "value": 2},
+        },
+    ],
+}
+
+
+def _setup_fixture_devices():
+    for payload in (
+        FIX_SENSOR_V1, FIX_SENSOR_V2, FIX_METER_V1, FIX_METER_V2,
+        FIX_BRANCH_V1, FIX_BRANCH_V2,
+    ):
+        client.post("/api/v1/definitions", json=payload)
+
+
+def _crc_msg(body: bytes) -> str:
+    return (body + crc16_ccitt(body).to_bytes(2, "big")).hex()
+
+
+def test_create_fixture_captures_baseline_snapshot():
+    _setup_fixture_devices()
+    hex_payload = _crc_msg(bytes([0xAA, 0x01, 0x00, 0xEB]))  # temp raw 235
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={
+            "name": "temp-branch",
+            "device_type": "fix_sensor",
+            "version": "1.0.0",
+            "hex": hex_payload,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["name"] == "temp-branch"
+    assert data["device_type"] == "fix_sensor"
+    assert data["version"] == "1.0.0"
+    assert data["hex"] == hex_payload
+    snap = data["snapshot"]
+    fields = {f["name"]: f for f in snap["fields"]}
+    assert fields["header"]["raw_value"] == 0xAA
+    assert fields["temperature"]["raw_value"] == 235
+    assert snap["checksum_valid"] is True
+    assert snap["branch_path"] == []  # unconditional v1
+    assert "created_at" in data
+
+
+def test_create_fixture_name_unique_within_device_type_only():
+    _setup_fixture_devices()
+    # same name under another device type is fine
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "temp-branch", "device_type": "fix_meter",
+              "version": "1.0.0", "hex": "011234"},
+    )
+    assert resp.status_code == 201, resp.text
+
+    # duplicate name inside the same device type -> 409
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "temp-branch", "device_type": "fix_sensor",
+              "version": "1.0.0", "hex": _crc_msg(bytes([0xAA, 0x01, 0x00, 0xEB]))},
+    )
+    assert resp.status_code == 409
+    assert "already exists" in resp.json()["detail"]
+
+
+def test_create_fixture_missing_definition_404_and_bad_baseline_422():
+    _setup_fixture_devices()
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "x", "device_type": "fix_sensor", "version": "9.9.9", "hex": "aabb"},
+    )
+    assert resp.status_code == 404
+
+    # message too short for the referenced baseline definition
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "short", "device_type": "fix_sensor", "version": "1.0.0", "hex": "aa01"},
+    )
+    assert resp.status_code == 422
+    assert "baseline parse failed" in resp.json()["detail"]
+
+    # invalid hex
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "badhex", "device_type": "fix_meter", "version": "1.0.0", "hex": "zz"},
+    )
+    assert resp.status_code == 422
+
+
+def test_create_fixture_with_expectation():
+    _setup_fixture_devices()
+    hex_payload = _crc_msg(bytes([0xAA, 0x01, 0x00, 0xEB]))
+
+    # matching expectation
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={
+            "name": "with-expect-ok",
+            "device_type": "fix_sensor",
+            "version": "1.0.0",
+            "hex": hex_payload,
+            "expect": {
+                "fields": [
+                    {"name": "header", "raw_value": 170},
+                    {"name": "temperature"},  # presence-only assertion
+                    {"name": "crc", "raw_value": crc16_ccitt(bytes([0xAA, 1, 0, 0xEB]))},
+                ],
+                "checksum_valid": True,
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    # the full snapshot is persisted regardless of the partial expectation
+    assert len(resp.json()["snapshot"]["fields"]) == 4
+
+    # mismatching raw_value -> 422 with per-field problems, fixture not stored
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={
+            "name": "with-expect-bad",
+            "device_type": "fix_sensor",
+            "version": "1.0.0",
+            "hex": hex_payload,
+            "expect": {"fields": [{"name": "header", "raw_value": 1}]},
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["message"] == "fixture expectation does not match baseline"
+    assert any("'header'" in p for p in detail["problems"])
+
+    # expectation referencing a field that the baseline never parses
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={
+            "name": "with-expect-ghost",
+            "device_type": "fix_sensor",
+            "version": "1.0.0",
+            "hex": hex_payload,
+            "expect": {"fields": [{"name": "humidity", "raw_value": 5}]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "not parsed" in resp.json()["detail"]["problems"][0]
+
+
+def test_run_fixture_against_baseline_passes():
+    _setup_fixture_devices()
+    resp = client.post("/api/v1/fixtures/temp-branch/run",
+                       json={"device_type": "fix_sensor"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["baseline_version"] == "1.0.0"
+    assert data["target_version"] == "1.0.0"
+    assert data["version_changed"] is False
+    assert data["parse_error"] is None
+    assert data["passed"] is True
+    cmp_ = data["comparison"]
+    assert cmp_["passed"] is True
+    assert cmp_["fields"]["passed"] is True
+    assert cmp_["branch_path"]["passed"] is True
+    assert cmp_["checksum"]["passed"] is True
+    assert cmp_["pass_rate"] == 1.0
+    assert cmp_["passed_checks"] == cmp_["total_checks"]
+    assert cmp_["errors"] == []
+    # four fields + no branches + one checksum check
+    assert cmp_["total_checks"] == 5
+
+    # only device_type given (target_version omitted)
+    resp = client.post("/api/v1/fixtures/temp-branch/run",
+                       json={"device_type": "fix_sensor"})
+    assert resp.status_code == 200
+    assert resp.json()["passed"] is True
+
+
+def test_run_fixture_against_changed_version_parse_failure_keeps_item_errors():
+    _setup_fixture_devices()
+    # v2 widens temperature to 32 bits: the 6-byte v1 message is too short
+    resp = client.post(
+        "/api/v1/fixtures/temp-branch/run",
+        json={"device_type": "fix_sensor", "target_version": "2.0.0"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["version_changed"] is True
+    assert data["target_version"] == "2.0.0"
+    assert data["passed"] is False
+    assert data["parse_error"] is not None
+    assert "too short" in data["parse_error"]
+    cmp_ = data["comparison"]
+    # every baseline field is reported removed + parse error retained
+    removed = {f["name"] for f in cmp_["fields"]["removed"]}
+    assert removed == {"header", "msg_type", "temperature", "crc"}
+    assert cmp_["fields"]["added"] == []
+    assert cmp_["checksum"]["passed"] is False
+    assert cmp_["passed_checks"] == 0
+    assert cmp_["pass_rate"] == 0.0
+    assert any(e.startswith("target parse failed") for e in cmp_["errors"])
+    assert any("field 'header'" in e for e in cmp_["errors"])
+
+
+def test_run_fixture_changed_raw_values_reports_diff_and_pass_rate():
+    _setup_fixture_devices()
+    resp = client.post("/api/v1/fixtures/temp-branch/run",
+                       json={"device_type": "fix_sensor", "target_version": "9.9.9"})
+    assert resp.status_code == 404  # missing target definition
+
+    # fix_meter fixture "temp-branch": baseline big-endian 0x1234 = 4660
+    resp = client.post("/api/v1/fixtures/temp-branch/run",
+                       json={"device_type": "fix_meter"})
+    assert resp.status_code == 200
+    assert resp.json()["target_version"] == "1.0.0"
+
+    resp = client.post(
+        "/api/v1/fixtures/temp-branch/run",
+        json={"device_type": "fix_meter", "target_version": "2.0.0"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["version_changed"] is True
+    assert data["parse_error"] is None
+    cmp_ = data["comparison"]
+    changed = {c["name"]: c for c in cmp_["fields"]["changed"]}
+    assert set(changed) == {"value"}
+    assert changed["value"]["baseline_raw_value"] == 0x1234
+    assert changed["value"]["actual_raw_value"] == 0x3412
+    names = {f["name"] for f in cmp_["fields"]["unchanged"]}
+    assert names == {"kind"}
+    assert cmp_["fields"]["added"] == [] and cmp_["fields"]["removed"] == []
+    assert cmp_["checksum"]["passed"] is True  # no checksum on either version
+    # 2 fields + 1 checksum check, one field changed -> 2/3
+    assert cmp_["total_checks"] == 3
+    assert cmp_["passed_checks"] == 2
+    assert cmp_["pass_rate"] == round(2 / 3, 4)
+    assert data["passed"] is False
+    assert any("'value'" in e for e in cmp_["errors"])
+
+
+def test_run_fixture_branch_path_changes():
+    _setup_fixture_devices()
+    # kind == 1 hits alarm on v1; on v2 the condition value is 2
+    client.post(
+        "/api/v1/fixtures",
+        json={"name": "alarm-hit", "device_type": "fix_branch",
+              "version": "1.0.0", "hex": "0105"},
+    )
+    resp = client.post("/api/v1/fixtures/alarm-hit/run",
+                       json={"device_type": "fix_branch", "target_version": "2.0.0"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    cmp_ = data["comparison"]
+    # v2 skips alarm when kind == 1: field disappears and branch flips
+    assert {f["name"] for f in cmp_["fields"]["removed"]} == {"alarm"}
+    assert {f["name"] for f in cmp_["fields"]["unchanged"]} == {"kind"}
+    assert cmp_["branch_path"]["passed"] is False
+    changed = {c["field"]: c for c in cmp_["branch_path"]["changed"]}
+    assert set(changed) == {"alarm"}
+    assert changed["alarm"]["baseline"]["matched"] is True
+    assert changed["alarm"]["actual"]["matched"] is False
+    assert changed["alarm"]["actual"]["action"] == "skipped"
+    assert data["passed"] is False
+    assert any("branch on 'alarm'" in e for e in cmp_["errors"])
+
+    # re-running v2's taken branch (kind == 2, alarm skipped) captured from v1
+    client.post(
+        "/api/v1/fixtures",
+        json={"name": "alarm-miss", "device_type": "fix_branch",
+              "version": "1.0.0", "hex": "0209"},
+    )
+    resp = client.post("/api/v1/fixtures/alarm-miss/run",
+                       json={"device_type": "fix_branch", "target_version": "2.0.0"})
+    data = resp.json()
+    cmp_ = data["comparison"]
+    # alarm added (now parsed on v2) and its raw value appears
+    assert {f["name"] for f in cmp_["fields"]["added"]} == {"alarm"}
+    changed = {c["field"]: c for c in cmp_["branch_path"]["changed"]}
+    assert changed["alarm"]["baseline"]["matched"] is False
+    assert changed["alarm"]["actual"]["matched"] is True
+
+
+def test_fixture_checksum_mismatch_is_reported():
+    _setup_fixture_devices()
+    body = bytes([0xAA, 0x01, 0x00, 0xEB])
+    good = _crc_msg(body)
+    bad = good[:-4] + "0000"  # corrupt crc
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "bad-crc", "device_type": "fix_sensor",
+              "version": "1.0.0", "hex": bad},
+    )
+    assert resp.status_code == 201  # checksum mismatch is still a parse result
+    snap = resp.json()["snapshot"]
+    assert snap["checksum_valid"] is False
+
+    resp = client.post("/api/v1/fixtures/bad-crc/run", json={"device_type": "fix_sensor"})
+    data = resp.json()
+    cmp_ = data["comparison"]
+    assert cmp_["checksum"]["baseline_valid"] is False
+    assert cmp_["checksum"]["actual_valid"] is False
+    # bad vs baseline bad -> the fixture is internally consistent (and the
+    # invalid checksum is faithfully captured in the baseline snapshot)
+    assert cmp_["checksum"]["passed"] is True
+    assert data["passed"] is True
+
+    # a corrupt-crc fixture run against the good-payload expectation shows the
+    # checksum-validation change explicitly
+    client.post(
+        "/api/v1/fixtures",
+        json={"name": "good-crc", "device_type": "fix_sensor",
+              "version": "1.0.0", "hex": good},
+    )
+    resp = client.post("/api/v1/fixtures/good-crc/run", json={"device_type": "fix_sensor"})
+    assert resp.json()["passed"] is True
+
+    # the comparison layer itself flags a checksum-result flip
+    from app.fixtures import compare_snapshots
+
+    flip = compare_snapshots(
+        {"fields": [], "branch_path": [], "checksum_valid": True},
+        {"fields": [], "branch_path": [], "checksum_valid": False},
+    )
+    assert flip["checksum"]["passed"] is False
+    assert any("checksum validation changed" in e for e in flip["errors"])
+
+
+def test_list_get_delete_fixtures():
+    _setup_fixture_devices()
+    resp = client.get("/api/v1/fixtures")
+    assert resp.status_code == 200
+    data = resp.json()
+    pairs = {(i["device_type"], i["name"]) for i in data["items"]}
+    assert ("fix_sensor", "temp-branch") in pairs
+    assert ("fix_meter", "temp-branch") in pairs
+    assert data["count"] == len(data["items"])
+
+    resp = client.get("/api/v1/fixtures", params={"device_type": "fix_branch"})
+    assert {i["name"] for i in resp.json()["items"]} == {"alarm-hit", "alarm-miss"}
+
+    # unique name resolves directly
+    resp = client.get("/api/v1/fixtures/alarm-hit")
+    assert resp.status_code == 200
+    assert resp.json()["device_type"] == "fix_branch"
+
+    # ambiguous name across device types -> 409 with candidates
+    resp = client.get("/api/v1/fixtures/temp-branch")
+    assert resp.status_code == 409
+    assert {c["device_type"] for c in resp.json()["detail"]["candidates"]} == {
+        "fix_sensor", "fix_meter",
+    }
+
+    # unknown name -> 404
+    assert client.get("/api/v1/fixtures/nope").status_code == 404
+    assert client.post(
+        "/api/v1/fixtures/nope/run", json={"device_type": "fix_sensor"}
+    ).status_code == 404
+
+    # delete: ambiguous -> 409, unique -> 204 then 404
+    assert client.delete("/api/v1/fixtures/temp-branch").status_code == 409
+    resp = client.delete("/api/v1/fixtures/alarm-hit")
+    assert resp.status_code == 204
+    assert resp.text == ""
+    assert client.get("/api/v1/fixtures/alarm-hit").status_code == 404
+
+    # the same-named fixture under fix_sensor is untouched
+    assert client.get("/api/v1/fixtures/alarm-miss").status_code == 200
+
+
+def test_fixture_hex_cleaning_and_body_validation():
+    _setup_fixture_devices()
+    # 0x prefix, separators and whitespace are cleaned like /parse
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "clean-hex", "device_type": "fix_meter",
+              "version": "1.0.0", "hex": "0x01_12 34"},
+    )
+    assert resp.status_code == 201, resp.text
+    resp = client.post("/api/v1/fixtures/clean-hex/run",
+                       json={"device_type": "fix_meter"})
+    assert resp.json()["passed"] is True
+
+    # unknown body fields rejected
+    resp = client.post(
+        "/api/v1/fixtures/clean-hex/run",
+        json={"device_type": "fix_meter", "target_version": "1.0.0", "extra": 1},
+    )
+    assert resp.status_code == 422
+
+    # invalid fixture name pattern
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "bad name!", "device_type": "fix_meter",
+              "version": "1.0.0", "hex": "011234"},
+    )
+    assert resp.status_code == 422
+
+
+def test_fixture_run_requires_device_type_and_query_disambiguation():
+    _setup_fixture_devices()
+    # device_type is mandatory in the run body
+    resp = client.post("/api/v1/fixtures/temp-branch/run", json={"target_version": "1.0.0"})
+    assert resp.status_code == 422
+    resp = client.post("/api/v1/fixtures/temp-branch/run", json={})
+    assert resp.status_code == 422
+
+    # GET / DELETE accept ?device_type= to disambiguate shared names
+    resp = client.get("/api/v1/fixtures/temp-branch", params={"device_type": "fix_meter"})
+    assert resp.status_code == 200
+    assert resp.json()["device_type"] == "fix_meter"
+
+    resp = client.delete("/api/v1/fixtures/temp-branch",
+                         params={"device_type": "fix_meter"})
+    assert resp.status_code == 204
+    # sensor copy survives; meter copy is gone
+    resp = client.get("/api/v1/fixtures/temp-branch", params={"device_type": "fix_meter"})
+    assert resp.status_code == 404
+    resp = client.get("/api/v1/fixtures/temp-branch", params={"device_type": "fix_sensor"})
+    assert resp.status_code == 200
+    # name is no longer ambiguous -> bare lookup works again
+    resp = client.get("/api/v1/fixtures/temp-branch")
+    assert resp.status_code == 200
+    assert resp.json()["device_type"] == "fix_sensor"
+
+
+def test_fixture_snapshot_covers_bool_and_repeated_fields():
+    _setup_fixture_devices()
+    # reuse the pre-registered array_dev definition (repeat) and a bool-bearing def
+    payload = {
+        "device_type": "fix_repeat",
+        "version": "1.0.0",
+        "fields": [
+            {"name": "en", "type": "bool", "bit_length": 1},
+            {"name": "n", "type": "uint", "bit_length": 7},
+            {"name": "vals", "type": "uint", "bit_length": 8,
+             "repeat": {"field": "n", "max": 4}},
+        ],
+    }
+    client.post("/api/v1/definitions", json=payload)
+    # en=1, n=2, vals=[0x11, 0x22] -> 1|0000010 = 0x82 then 11 22
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "rep", "device_type": "fix_repeat",
+              "version": "1.0.0", "hex": "821122"},
+    )
+    assert resp.status_code == 201, resp.text
+    snap = resp.json()["snapshot"]
+    by_name = {f["name"]: f for f in snap["fields"]}
+    assert by_name["en"]["raw_value"] == 1  # bool normalized
+    assert by_name["n"]["raw_value"] == 2
+    assert by_name["vals"]["raw_value"] == [0x11, 0x22]  # repeated -> list
+    assert snap["checksum_valid"] is None  # no checksum configured
+
+    resp = client.post("/api/v1/fixtures/rep/run",
+                       json={"device_type": "fix_repeat"})
+    assert resp.status_code == 200
+    assert resp.json()["passed"] is True
+    assert resp.json()["comparison"]["pass_rate"] == 1.0

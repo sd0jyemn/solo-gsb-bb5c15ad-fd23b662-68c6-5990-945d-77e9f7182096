@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -82,6 +82,11 @@ docker compose up --build
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
+| POST | `/api/v1/fixtures` | 保存带名称的解析回归样例（名称在**设备类型内**唯一，重复返回 409） |
+| GET  | `/api/v1/fixtures` | 列出回归样例，参数：`device_type` |
+| GET  | `/api/v1/fixtures/{name}` | 按名称查询样例（跨设备类型重名时用 `?device_type=` 消歧，否则返回 409） |
+| DELETE | `/api/v1/fixtures/{name}` | 删除样例（消歧规则同上） |
+| POST | `/api/v1/fixtures/{name}/run` | 运行回归样例：用现有解析器重新解析并与基线快照逐字段比较 |
 
 > 停用后的定义不参与列表（默认）和 latest 查询，但仍可按显式版本解析/编码历史报文。
 
@@ -401,6 +406,133 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 > 设备类型下没有任何注册版本（含停用）时返回 `404`；hex 非法/为空返回 `422`，清洗规则与 `/parse` 一致（忽略空白、`_`、`-` 与 `0x` 前缀）。
 
+### 8. 解析回归样例（/fixtures）
+
+报文定义升级后，需要确认同一批历史报文在新版本上的解析表现。回归样例把一条报文与它在某个版本上的**字段快照**绑定存储（SQLite），随后可对任意目标版本（或默认的基线版本）重跑，逐字段比较：
+
+1. **字段名 + `raw_value`**：数值字段比较原始整数（`uint`/`int`；重复字段为整数数组；`bool` 归一化为 0/1；`hex`/`ascii` 无 raw 值，只按字段名比较存在性）。
+2. **分支路径 `branch_path`**：逐条件字段比较 `matched` 与 `action`（`parsed`/`skipped`）。
+3. **校验结果**：比较 `checksum.valid`（目标定义没有校验字段时为 `null`）。
+
+**保存样例**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/fixtures \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "temp-branch",
+    "device_type": "temp_sensor",
+    "version": "1.0.0",
+    "hex": "aa10eb008936",
+    "expect": {
+      "fields": [
+        {"name": "header", "raw_value": 170},
+        {"name": "temperature", "raw_value": 235}
+      ],
+      "branch_path": [{"field": "temperature", "matched": true, "action": "parsed"}],
+      "checksum_valid": true
+    }
+  }'
+```
+
+- 创建时服务先按 `version` 解析一次 `hex`，把完整快照（全部字段 / 全部分支 / 校验结果）作为**基线**持久化；基线解析失败返回 422，引用的定义不存在返回 404。
+- `expect` 各部分均可选，只做**子集断言**：`fields[].raw_value` 省略时仅要求该字段在基线中出现；与实际解析不符返回 422 并在 `detail.problems` 中逐项列出原因。无论是否提供 `expect`，持久化的始终是完整快照。
+- `name` 在**同一 `device_type` 内唯一**（允许字母数字及 `_.:-`）；重复保存返回 409。不同设备类型可以重名，查询/删除/运行时用 `device_type` 消歧。
+
+返回示例（节选）：
+
+```json
+{
+  "name": "temp-branch",
+  "device_type": "temp_sensor",
+  "version": "1.0.0",
+  "hex": "aa10eb008936",
+  "snapshot": {
+    "fields": [
+      {"name": "header", "raw_value": 170},
+      {"name": "msg_type", "raw_value": 1},
+      {"name": "flags", "raw_value": 0},
+      {"name": "temperature", "raw_value": 235},
+      {"name": "crc", "raw_value": 35126}
+    ],
+    "branch_path": [
+      {"field": "temperature", "matched": true, "action": "parsed"},
+      {"field": "humidity", "matched": false, "action": "skipped"}
+    ],
+    "checksum_valid": true
+  },
+  "created_at": "2026-09-21T..."
+}
+```
+
+**运行样例**
+
+```bash
+# 对基线版本自身回归（body 也可省略 device_type 以外的字段）
+curl -X POST http://localhost:8000/api/v1/fixtures/temp-branch/run \
+  -H 'Content-Type: application/json' \
+  -d '{"device_type": "temp_sensor"}'
+
+# 对新版本回归
+curl -X POST http://localhost:8000/api/v1/fixtures/temp-branch/run \
+  -H 'Content-Type: application/json' \
+  -d '{"device_type": "temp_sensor", "target_version": "2.0.0"}'
+```
+
+- 请求体必须包含 `device_type`（名称只在设备类型内唯一）；`target_version` 缺省时使用样例的基线版本。目标版本不存在返回 404。
+- 目标版本解析**失败**（报文过短等）不返回 5xx，而是 HTTP 200 + `parse_error` 字段，并把每个基线字段/分支/校验项都保留为失败项，便于一次看到全部问题。
+
+响应示例（版本变化，字段差异）：
+
+```json
+{
+  "name": "temp-branch",
+  "device_type": "temp_sensor",
+  "baseline_version": "1.0.0",
+  "target_version": "2.0.0",
+  "version_changed": true,
+  "hex": "aa10eb008936",
+  "baseline": { "...": "保存时的快照..." },
+  "actual": { "...": "目标版本的实际快照..." },
+  "parse_error": null,
+  "passed": false,
+  "comparison": {
+    "fields": {
+      "added":    [{"name": "status", "raw_value": 0}],
+      "removed":  [{"name": "flags", "raw_value": 0}],
+      "changed":  [{"name": "temperature", "baseline_raw_value": 235, "actual_raw_value": 2350}],
+      "unchanged": [{"name": "header", "raw_value": 170}],
+      "passed": false
+    },
+    "branch_path": {
+      "added": [],
+      "removed": [],
+      "changed": [
+        {"field": "humidity",
+         "baseline": {"field": "humidity", "matched": false, "action": "skipped"},
+         "actual":   {"field": "humidity", "matched": true,  "action": "parsed"}}
+      ],
+      "unchanged": [],
+      "passed": false
+    },
+    "checksum": {"baseline_valid": true, "actual_valid": true, "passed": true},
+    "total_checks": 9,
+    "passed_checks": 6,
+    "pass_rate": 0.6667,
+    "errors": [
+      "field 'status' newly appears in target parse (raw_value 0)",
+      "field 'flags' missing in target parse (baseline raw_value 0)",
+      "field 'temperature' raw_value changed: baseline 235 -> actual 2350",
+      "branch on 'humidity' changed: baseline matched false (skipped) -> actual matched true (parsed)"
+    ]
+  }
+}
+```
+
+- `comparison.fields` 与 `comparison.branch_path` 各自给出 `added` / `removed` / `changed` / `unchanged` 明细；`errors` 是所有未通过项的逐条说明（含目标解析失败时的 `target parse failed: ...`）。
+- `total_checks = 字段项数 + 分支项数 + 1（校验）`，`pass_rate = passed_checks / total_checks`；全部一致且无解析错误时顶层 `passed` 为 `true`、`pass_rate` 为 `1.0`。
+- 列表 `GET /api/v1/fixtures?device_type=temp_sensor`；按名查询/删除支持 `?device_type=` 消歧，名称跨设备类型重复且未消歧时返回 409（`detail.candidates` 列出候选）。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -418,9 +550,32 @@ app/
   parser.py     # 按位解析器（位读取、条件分支、repeat 数组展开、校验和验证）
   encoder.py    # 按位编码器（位写入、scale/offset 反算、repeat 数组、校验和自动写入）
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
+  fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
-  database.py   # SQLite 持久化（启动自动建表）
+  database.py   # SQLite 持久化（definitions / fixtures 两表，启动自动建表）
 tests/test_api.py
 Dockerfile
 docker-compose.yml
+```
+
+## Docker 镜像与持久化
+
+`Dockerfile` 基于 `python:3.12-slim`，仅安装运行依赖（`requirements.txt`），启动命令为
+`uvicorn app.main:app --host 0.0.0.0 --port 8000`。`docker-compose.yml` 将容器内数据库
+`/data/parser.db` 挂载到 named volume `parser-data`，因此注册的报文定义与回归样例在容器
+重建后仍然保留；首次启动时两表（`definitions`、`fixtures`）自动创建，无需手动迁移。
+
+```bash
+# 启动（首次自动构建镜像）
+docker compose up --build
+
+# 后台运行 / 查看日志 / 停止
+docker compose up -d --build
+docker compose logs -f
+docker compose down            # 不删除数据卷；加 -v 才会清空 parser-data
+
+# 不用 compose 直接运行
+docker build -t msg-parser .
+docker run -p 8000:8000 -e DB_PATH=/data/parser.db \
+  -v parser-data:/data msg-parser
 ```
