@@ -1373,3 +1373,574 @@ def test_compatibility_rejects_repeat_definitions_422():
     resp = _compat("array_dev", "3.0.0", "1.0.0")
     assert resp.status_code == 422
     assert "repeated" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Parse regression fixtures (/api/v1/fixtures)
+# ---------------------------------------------------------------------------
+
+FX_DEVICE = "fixture_sensor"
+
+FX_DEF_V1 = {
+    "device_type": FX_DEVICE,
+    "version": "1.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 4},
+        {"name": "flags", "type": "uint", "bit_length": 4},
+        {
+            "name": "temperature",
+            "type": "int",
+            "bit_length": 16,
+            "endianness": "little",
+            "scale": 0.1,
+            "condition": {"field": "msg_type", "op": "eq", "value": 1},
+        },
+        {
+            "name": "humidity",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "msg_type", "op": "eq", "value": 2},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+# v2: same layout/widths but temperature becomes big-endian -> raw value changes
+FX_DEF_V2_BE = {
+    "device_type": FX_DEVICE,
+    "version": "2.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 4},
+        {"name": "flags", "type": "uint", "bit_length": 4},
+        {
+            "name": "temperature",
+            "type": "int",
+            "bit_length": 16,
+            "endianness": "big",
+            "scale": 0.1,
+            "condition": {"field": "msg_type", "op": "eq", "value": 1},
+        },
+        {
+            "name": "humidity",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "msg_type", "op": "eq", "value": 2},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+# v3: same as v1 but adds a byte-sized pressure field on the temperature
+# branch -> the 48-bit temperature message no longer parses, while the
+# humidity branch layout is unchanged (one extra branch-path entry).
+FX_DEF_V3_PRESSURE = {
+    "device_type": FX_DEVICE,
+    "version": "3.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 4},
+        {"name": "flags", "type": "uint", "bit_length": 4},
+        {
+            "name": "temperature",
+            "type": "int",
+            "bit_length": 16,
+            "endianness": "little",
+            "scale": 0.1,
+            "condition": {"field": "msg_type", "op": "eq", "value": 1},
+        },
+        {
+            "name": "pressure",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "msg_type", "op": "eq", "value": 1},
+        },
+        {
+            "name": "humidity",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "msg_type", "op": "eq", "value": 2},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+# v4: requires far more bits than the v1 6-byte message provides -> parse error
+FX_DEF_V4_TOOLONG = {
+    "device_type": FX_DEVICE,
+    "version": "4.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "payload", "type": "uint", "bit_length": 64},
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+    "checksum": {"field": "crc", "algorithm": "crc16-ccitt"},
+}
+
+# v5: identical to v1 but without a checksum -> only the checksum verdict differs
+FX_DEF_V5_NOCRC = {
+    "device_type": FX_DEVICE,
+    "version": "5.0.0",
+    "fields": [
+        {"name": "header", "type": "uint", "bit_length": 8},
+        {"name": "msg_type", "type": "uint", "bit_length": 4},
+        {"name": "flags", "type": "uint", "bit_length": 4},
+        {
+            "name": "temperature",
+            "type": "int",
+            "bit_length": 16,
+            "endianness": "little",
+            "scale": 0.1,
+            "condition": {"field": "msg_type", "op": "eq", "value": 1},
+        },
+        {
+            "name": "humidity",
+            "type": "uint",
+            "bit_length": 8,
+            "condition": {"field": "msg_type", "op": "eq", "value": 2},
+        },
+        {"name": "crc", "type": "uint", "bit_length": 16},
+    ],
+}
+
+
+def _fx_hex(body: bytes) -> str:
+    return (body + crc16_ccitt(body).to_bytes(2, "big")).hex()
+
+
+FX_TEMP_HEX = _fx_hex(bytes([0xAA, 0x10, 0xEB, 0x00]))
+FX_HUM_HEX = _fx_hex(bytes([0xAA, 0x20, 0x55]))
+
+
+def _register_fixture_defs():
+    assert client.post("/api/v1/definitions", json=FX_DEF_V1).status_code == 201
+    assert client.post("/api/v1/definitions", json=FX_DEF_V2_BE).status_code == 201
+    assert client.post("/api/v1/definitions", json=FX_DEF_V3_PRESSURE).status_code == 201
+    assert client.post("/api/v1/definitions", json=FX_DEF_V4_TOOLONG).status_code == 201
+    assert client.post("/api/v1/definitions", json=FX_DEF_V5_NOCRC).status_code == 201
+
+
+def _create_fixture(name, **overrides):
+    payload = {
+        "name": name,
+        "device_type": FX_DEVICE,
+        "version": "1.0.0",
+        "hex": FX_TEMP_HEX,
+    }
+    payload.update(overrides)
+    return client.post("/api/v1/fixtures", json=payload)
+
+
+def test_fixture_create_captures_snapshot():
+    _register_fixture_defs()
+    resp = _create_fixture("temp-branch")
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["name"] == "temp-branch"
+    assert data["device_type"] == FX_DEVICE
+    assert data["version"] == "1.0.0"
+    assert data["hex"] == FX_TEMP_HEX
+
+    snap = data["snapshot"]
+    fields = {f["name"]: f["raw_value"] for f in snap["fields"]}
+    assert fields == {
+        "header": 0xAA,
+        "msg_type": 1,
+        "flags": 0,
+        "temperature": 235,
+        "crc": crc16_ccitt(bytes([0xAA, 0x10, 0xEB, 0x00])),
+    }
+    # skipped branch field (humidity) is absent from the parsed-field snapshot
+    assert "humidity" not in fields
+    branches = {b["field"]: b for b in snap["branch_path"]}
+    assert branches["temperature"]["matched"] is True
+    assert branches["humidity"]["matched"] is False
+    assert snap["checksum_valid"] is True
+    assert snap["checksum_algorithm"] == "crc16-ccitt"
+    assert "created_at" in data
+
+
+def test_fixture_name_unique_per_device_type_only():
+    # same (device_type, name) -> 409
+    resp = _create_fixture("temp-branch")
+    assert resp.status_code == 409
+    assert "already exists" in resp.json()["detail"]
+
+    # same name under a different device type is fine once that type exists
+    other = dict(FX_DEF_V1)
+    other["device_type"] = "fixture_sensor_other"
+    assert client.post("/api/v1/definitions", json=other).status_code == 201
+    resp = _create_fixture(
+        "temp-branch", device_type="fixture_sensor_other"
+    )
+    assert resp.status_code == 201, resp.text
+
+
+def test_fixture_create_validation_errors():
+    # unknown device/version
+    resp = client.post(
+        "/api/v1/fixtures",
+        json={"name": "x", "device_type": "ghost", "hex": FX_TEMP_HEX},
+    )
+    assert resp.status_code == 404
+
+    # baseline message that does not parse -> 422 (not stored)
+    resp = _create_fixture("truncated", hex="AABB")
+    assert resp.status_code == 422
+    assert "baseline" in resp.json()["detail"]
+    assert (
+        client.get("/api/v1/fixtures/truncated", params={"device_type": FX_DEVICE}).status_code
+        == 404
+    )
+
+    # invalid hex -> 422
+    assert _create_fixture("badhex", hex="zzzz").status_code == 422
+
+    # illegal name -> 422
+    assert _create_fixture("bad name!").status_code == 422
+
+    # extra/unknown body fields are rejected
+    assert _create_fixture("extra", bogus=1).status_code == 422
+
+
+def test_fixture_create_with_expected_fields():
+    # subset: omitted raw_value is captured from the actual parse
+    resp = _create_fixture(
+        "subset",
+        expected_fields=[
+            {"name": "header"},
+            {"name": "temperature"},
+        ],
+    )
+    assert resp.status_code == 201, resp.text
+    names = [f["name"] for f in resp.json()["snapshot"]["fields"]]
+    assert names == ["header", "temperature"]
+    assert resp.json()["snapshot"]["fields"][1]["raw_value"] == 235
+
+    # explicit raw_value overrides the captured baseline (intentional mismatch)
+    resp = _create_fixture(
+        "pinned",
+        expected_fields=[{"name": "header", "raw_value": 1}],
+    )
+    assert resp.status_code == 201
+    assert resp.json()["snapshot"]["fields"][0]["raw_value"] == 1
+
+    # explicit raw_value null is respected (distinct from "omitted")
+    resp = _create_fixture(
+        "nulled",
+        expected_fields=[{"name": "header", "raw_value": None}],
+    )
+    assert resp.status_code == 201
+    assert resp.json()["snapshot"]["fields"][0]["raw_value"] is None
+
+    # expected field not present in the parse -> 422
+    resp = _create_fixture(
+        "unknown-expected",
+        expected_fields=[{"name": "humidity"}],  # skipped on this branch
+    )
+    assert resp.status_code == 422
+    resp = _create_fixture(
+        "ghost-expected",
+        expected_fields=[{"name": "nope"}],
+    )
+    assert resp.status_code == 422
+
+
+def test_fixture_run_same_version_passes():
+    resp = client.post(
+        f"/api/v1/fixtures/temp-branch/run?device_type={FX_DEVICE}", json={}
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["passed"] is True
+    assert data["version_changed"] is False
+    assert data["baseline_version"] == data["run_version"] == "1.0.0"
+    assert data["pass_rate"] == 1.0
+    assert data["passed_checks"] == data["total_checks"]
+    assert data["differences"]["fields_added"] == []
+    assert data["differences"]["fields_removed"] == []
+    assert data["differences"]["fields_changed"] == []
+    assert data["differences"]["branches_changed"] == []
+    assert data["differences"]["checksum_matched"] is True
+    assert set(data["matched"]["fields"]) == {
+        "header",
+        "msg_type",
+        "flags",
+        "temperature",
+        "crc",
+    }
+    # full parse result is embedded
+    assert data["parse_result"]["checksum"]["valid"] is True
+
+
+def test_fixture_run_accepts_no_body():
+    resp = client.post(f"/api/v1/fixtures/temp-branch/run?device_type={FX_DEVICE}")
+    assert resp.status_code == 200
+    assert resp.json()["passed"] is True
+
+
+def test_fixture_run_pinned_mismatch_lowers_pass_rate():
+    resp = client.post(
+        f"/api/v1/fixtures/pinned/run?device_type={FX_DEVICE}", json={}
+    )
+    data = resp.json()
+    assert data["passed"] is False
+    changed = data["differences"]["fields_changed"]
+    assert changed == [{"name": "header", "baseline": 1, "actual": 0xAA}]
+    # the subset baseline names only header; every other parsed field is an
+    # unexpected addition: 1 changed + 4 added fields, 2 branches + checksum ok
+    assert {f["name"] for f in data["differences"]["fields_added"]} == {
+        "msg_type",
+        "flags",
+        "temperature",
+        "crc",
+    }
+    # checks = baseline fields (1) + added fields (4) + branches (2) + crc (1) = 8
+    assert data["total_checks"] == 8
+    assert data["passed_checks"] == 3  # both branches + checksum
+    assert abs(data["pass_rate"] - (3 / 8)) < 1e-6
+
+
+def test_fixture_run_against_new_version_reports_diff():
+    # v2 only flips temperature endianness: the message still parses fully and
+    # the diff reports exactly the changed raw value.
+    resp = client.post(
+        f"/api/v1/fixtures/temp-branch/run?device_type={FX_DEVICE}",
+        json={"target_version": "2.0.0"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["version_changed"] is True
+    assert data["run_version"] == "2.0.0"
+    assert data["passed"] is False
+
+    diffs = data["differences"]
+    # bytes EB 00: little-endian int16 = 0x00EB = 235; big-endian int16 =
+    # 0xEB00, sign-extended to -5376
+    assert diffs["fields_changed"] == [
+        {"name": "temperature", "baseline": 235, "actual": -5376}
+    ]
+    assert diffs["fields_added"] == []
+    assert diffs["fields_removed"] == []
+    assert diffs["branches_changed"] == []
+    assert diffs["branches_added"] == []
+    assert diffs["branches_removed"] == []
+    # fields 5 (1 fails) + branches 2 + checksum 1 = 8 checks, 7 pass
+    assert data["total_checks"] == 8
+    assert data["passed_checks"] == 7
+    assert data["pass_rate"] == 0.875
+
+
+def test_fixture_run_parse_failure_is_retained_per_fixture():
+    # v3 adds pressure (8 bits) on this branch -> message too short; the run
+    # stays HTTP 200 and carries the parser error instead of crashing.
+    resp = client.post(
+        f"/api/v1/fixtures/temp-branch/run?device_type={FX_DEVICE}",
+        json={"target_version": "3.0.0"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["passed"] is False
+    assert data["error"]
+    assert "too short" in data["error"] or "need" in data["error"]
+    assert data["pass_rate"] == 0.0
+    assert data["total_checks"] == 0
+    assert data["version_changed"] is True
+
+    # v4 needs far more bytes than available: error retained, not a 5xx/422
+    resp = client.post(
+        f"/api/v1/fixtures/temp-branch/run?device_type={FX_DEVICE}",
+        json={"target_version": "4.0.0"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["passed"] is False
+    assert data["error"]
+    assert "too short" in data["error"]
+
+
+def test_fixture_run_version_change_unaffected_branch_still_passes():
+    # humidity branch: v1/v3 layouts are byte-identical there (pressure is only
+    # on the temperature branch), so fields/raw/checksum all match.
+    assert _create_fixture("hum-branch", hex=FX_HUM_HEX).status_code == 201
+    resp = client.post(
+        f"/api/v1/fixtures/hum-branch/run?device_type={FX_DEVICE}",
+        json={"target_version": "3.0.0"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["version_changed"] is True
+    assert data["differences"]["fields_added"] == []
+    assert data["differences"]["fields_removed"] == []
+    assert data["differences"]["fields_changed"] == []
+    # pressure conditional exists only in v3 -> an added branch path entry, but
+    # its field is skipped on this message, so no added field
+    assert [b["field"] for b in data["differences"]["branches_added"]] == [
+        "pressure"
+    ]
+    assert data["differences"]["checksum_matched"] is True
+
+
+def test_fixture_run_added_branch_counts_against_pass_rate():
+    # same humidity run as above: v3 has one extra conditional -> 1 extra check
+    data = client.post(
+        f"/api/v1/fixtures/hum-branch/run?device_type={FX_DEVICE}",
+        json={"target_version": "3.0.0"},
+    ).json()
+    # humidity field + header + msg_type + flags + crc = 5 fields;
+    # branches: temperature, humidity baseline (2) + pressure added (1);
+    # checksum 1 -> total 9, the added branch fails -> 8/9
+    assert data["total_checks"] == 9
+    assert data["passed_checks"] == 8
+    assert abs(data["pass_rate"] - (8 / 9)) < 1e-6
+    assert data["passed"] is False
+
+
+def test_fixture_run_404s():
+    # unknown fixture
+    resp = client.post(
+        f"/api/v1/fixtures/ghost/run?device_type={FX_DEVICE}", json={}
+    )
+    assert resp.status_code == 404
+
+    # unknown target version
+    resp = client.post(
+        f"/api/v1/fixtures/temp-branch/run?device_type={FX_DEVICE}",
+        json={"target_version": "9.9.9"},
+    )
+    assert resp.status_code == 404
+
+    # missing device_type query parameter -> 422
+    resp = client.post("/api/v1/fixtures/temp-branch/run")
+    assert resp.status_code == 422
+
+
+def test_fixture_run_checksum_verdict_diff_is_not_an_error():
+    # Baseline fixture on v1 (checksum valid); run against v5 whose layout is
+    # identical but configures no checksum. Parsing still succeeds and only the
+    # checksum verdict differs.
+    assert _create_fixture("crc-vs-none").status_code == 201
+    resp = client.post(
+        f"/api/v1/fixtures/crc-vs-none/run?device_type={FX_DEVICE}",
+        json={"target_version": "5.0.0"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "error" not in data
+    assert data["passed"] is False
+    checksum = data["differences"]["checksum"]
+    assert checksum["baseline_valid"] is True
+    assert checksum["actual_valid"] is None
+    assert data["differences"]["checksum_matched"] is False
+    # everything else matches: 5 fields + 2 branches pass, checksum fails -> 7/8
+    assert data["total_checks"] == 8
+    assert data["passed_checks"] == 7
+    assert data["pass_rate"] == 0.875
+
+
+def test_fixture_run_checksum_invalid_baseline_is_reproduced():
+    # A baseline captured with a corrupt CRC stores valid=false; re-running the
+    # same version reproduces it (both verdicts false -> check check passes).
+    bad = FX_TEMP_HEX[:-2] + ("00" if FX_TEMP_HEX[-2:] != "00" else "ff")
+    assert _create_fixture("bad-crc", hex=bad).status_code == 201
+    resp = client.post(
+        f"/api/v1/fixtures/bad-crc/run?device_type={FX_DEVICE}", json={}
+    )
+    data = resp.json()
+    assert data["passed"] is True
+    assert data["differences"]["checksum"]["baseline_valid"] is False
+    assert data["differences"]["checksum"]["actual_valid"] is False
+    assert data["differences"]["checksum_matched"] is True
+
+
+def test_fixture_list_and_get():
+    # self-contained: create fixtures under a fresh device type
+    list_device = "fixture_list_dev"
+    list_def = dict(FX_DEF_V1)
+    list_def["device_type"] = list_device
+    assert client.post("/api/v1/definitions", json=list_def).status_code == 201
+    list_hex = _fx_hex(bytes([0xAA, 0x10, 0xEB, 0x00]))
+    for fx_name in ("list-a", "list-b"):
+        assert (
+            client.post(
+                "/api/v1/fixtures",
+                json={
+                    "name": fx_name,
+                    "device_type": list_device,
+                    "version": "1.0.0",
+                    "hex": list_hex,
+                },
+            ).status_code
+            == 201
+        )
+
+    resp = client.get("/api/v1/fixtures")
+    assert resp.status_code == 200
+    all_items = resp.json()["items"]
+    names = {f["name"] for f in all_items}
+    assert {"list-a", "list-b"} <= names
+    assert resp.json()["count"] == len(all_items)
+
+    resp = client.get("/api/v1/fixtures", params={"device_type": list_device})
+    list_items = resp.json()["items"]
+    assert resp.json()["count"] == 2
+    assert {f["name"] for f in list_items} == {"list-a", "list-b"}
+    assert all(f["device_type"] == list_device for f in list_items)
+
+    resp = client.get(
+        "/api/v1/fixtures/list-a", params={"device_type": list_device}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "list-a"
+
+    # the same name can live under a different device type (uniqueness is per
+    # device type), so the d2 copy resolves to d2 rather than 404
+    other_device = "fixture_list_dev_other"
+    other_def = dict(list_def)
+    other_def["device_type"] = other_device
+    assert client.post("/api/v1/definitions", json=other_def).status_code == 201
+    assert (
+        client.post(
+            "/api/v1/fixtures",
+            json={
+                "name": "list-a",
+                "device_type": other_device,
+                "version": "1.0.0",
+                "hex": list_hex,
+            },
+        ).status_code
+        == 201
+    )
+    other = client.get(
+        "/api/v1/fixtures/list-a", params={"device_type": other_device}
+    )
+    assert other.status_code == 200
+    assert other.json()["device_type"] == other_device
+
+    # genuinely unknown names -> 404
+    assert (
+        client.get("/api/v1/fixtures/ghost", params={"device_type": list_device}).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/api/v1/fixtures/list-a", params={"device_type": "no-such-device"}
+        ).status_code
+        == 404
+    )
+
+
+def test_fixture_persists_in_same_database():
+    # a fresh client against the same DB_PATH still sees the fixture
+    from fastapi.testclient import TestClient
+
+    client2 = TestClient(app)
+    resp = client2.get(
+        "/api/v1/fixtures/temp-branch", params={"device_type": FX_DEVICE}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["version"] == "1.0.0"

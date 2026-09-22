@@ -13,13 +13,25 @@ docker compose up --build
 - 交互式文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
 
+不使用 compose 时也可以直接用 Docker：
+
+```bash
+docker build -t msg-parser .
+docker run --rm -p 8000:8000 \
+  -v parser-data:/data \
+  -e DB_PATH=/data/parser.db \
+  msg-parser
+```
+
+首次启动自动建表（`definitions`、`fixtures`），无需手动初始化；停止后 `parser-data` 卷中的报文定义与回归样例不会丢失。如需从零开始：`docker compose down -v`。
+
 ## 配置
 
 通过环境变量配置（见 `docker-compose.yml`）：
 
 | 变量      | 默认值             | 说明                 |
 | --------- | ------------------ | -------------------- |
-| `DB_PATH` | `/data/parser.db`  | SQLite 数据库文件路径（容器内），已挂载 named volume `parser-data` 持久化 |
+| `DB_PATH` | `/data/parser.db`  | SQLite 数据库文件路径（容器内），报文定义与回归样例均存于此，已挂载 named volume `parser-data` 持久化 |
 
 端口映射在 `docker-compose.yml` 中为 `8000:8000`，如需修改主机端口，改左侧即可（如 `"9000:8000"`）。
 
@@ -82,6 +94,10 @@ docker compose up --build
 | POST | `/api/v1/parse` | 解析报文（`version` 缺省时使用最新启用版本） |
 | POST | `/api/v1/detect` | 不传版本，用全部已注册版本（含停用）逐一解析以自动识别版本 |
 | POST | `/api/v1/encode` | 反向编码：由字段值生成报文（版本选择规则同 parse） |
+| POST | `/api/v1/fixtures` | 保存解析回归样例（`name` 在设备类型内唯一，重复返回 409） |
+| GET  | `/api/v1/fixtures` | 列出回归样例，参数：`device_type` |
+| GET  | `/api/v1/fixtures/{name}?device_type=...` | 查询单个样例（含基线快照） |
+| POST | `/api/v1/fixtures/{name}/run?device_type=...` | 重新解析样例并与基线逐字段/分支/校验结果比对，body 可传 `{"target_version": "..."}` |
 
 > 停用后的定义不参与列表（默认）和 latest 查询，但仍可按显式版本解析/编码历史报文。
 
@@ -401,6 +417,93 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 > 设备类型下没有任何注册版本（含停用）时返回 `404`；hex 非法/为空返回 `422`，清洗规则与 `/parse` 一致（忽略空白、`_`、`-` 与 `0x` 前缀）。
 
+### 8. 解析回归样例（/fixtures）
+
+把"报文 + 期望解析结果"固化为**带名称的回归样例**，用于版本升级后批量回归：创建时服务立即按指定（或最新启用）版本解析一次，将解析结果存为基线快照；运行样例时重新调用同一个解析器，把新结果与基线按**字段名与 raw_value、分支路径、校验结果**逐项比对。
+
+**保存样例** `POST /api/v1/fixtures`：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `name` | 样例名，`[A-Za-z0-9._-]` 且在 `device_type` 内唯一；重名返回 `409`（跨设备类型可同名） |
+| `device_type` / `version` | 基线定义；`version` 缺省取最新启用版本，显式版本即使已停用也可用 |
+| `hex` | 样例报文（清洗规则同 `/parse`）；基线必须能解析成功，否则返回 `422` 且不落库 |
+| `expected_fields` | 可选，期望字段快照。省略时自动捕获**全部**解析字段；提供时每项形如 `{"name": "temperature"}`（raw_value 从实际解析捕获）或 `{"name": "header", "raw_value": 170}`（显式钉死基线）。字段不存在或被条件跳过时返回 `422` |
+
+快照中每个字段以 `name` + `raw_value`（数值字段的原始值，含 repeat 数组；bool/hex/ascii 取解析值）记录，同时保存完整 `branch_path`（各条件字段的 matched/action/actual_value）与校验和判定（`checksum_valid`）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/fixtures \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "temp-branch", "device_type": "temp_sensor", "version": "1.0.0",
+       "hex": "aa10eb008936"}'
+```
+
+**运行样例** `POST /api/v1/fixtures/{name}/run?device_type=temp_sensor`，请求体可省略，或传 `{"target_version": "2.0.0"}` 用另一个已注册版本解析同一条报文：
+
+- 不传 `target_version`：按样例自身的基线版本重跑（纯回归，解析器行为变化即暴露）。
+- 传 `target_version`：按目标版本解析；`version_changed` 为 `true`，差异结果即版本间回归对比。目标版本不存在返回 `404`。
+- 目标版本**解析失败**（报文过短、计数超上限等）时仍返回 `200`，响应体携带逐样例的 `error` 字段、`passed=false`、`pass_rate=0.0`——失败被保留而不会中断整次运行。
+
+响应按 added/removed/changed 三类给出差异，并附通过率：
+
+```json
+{
+  "name": "temp-branch",
+  "device_type": "temp_sensor",
+  "baseline_version": "1.0.0",
+  "run_version": "2.0.0",
+  "version_changed": true,
+  "passed": false,
+  "pass_rate": 0.875,
+  "passed_checks": 7,
+  "total_checks": 8,
+  "differences": {
+    "fields_added": [],
+    "fields_removed": [],
+    "fields_changed": [
+      {"name": "temperature", "baseline": 235, "actual": -5376}
+    ],
+    "branches_added": [],
+    "branches_removed": [],
+    "branches_changed": [],
+    "checksum": {"baseline_valid": true, "actual_valid": true, "actual": {"_": "同 /parse 的 checksum 节"}},
+    "checksum_matched": true
+  },
+  "matched": {"fields": ["header", "msg_type", "flags", "crc"], "branches": ["temperature", "humidity"]},
+  "baseline_snapshot": { "_": "创建时的快照" },
+  "actual_snapshot":   { "_": "本次解析快照" },
+  "parse_result":      { "_": "与 /parse 完全一致的完整解析结果" }
+}
+```
+
+**比对口径**
+
+- **字段**：按字段名对齐；基线有、目标没有（如被新分支跳过）→ `fields_removed`；目标多出 → `fields_added`；同名但 `raw_value` 不同（如端序/位宽/缩放变化）→ `fields_changed`。
+- **分支路径**：按条件字段名对齐，比较 `matched`、`action`、`actual_value`；同样分 added/removed/changed。注意：仅在某一分支才解析的新增字段，在不触发该分支的报文上不会产生 added 字段，但新增的条件本身会产生 `branches_added`。
+- **校验结果**：比较基线与本次的校验通过与否；目标版本未配置校验和时 `actual_valid` 为 `null`，与基线 `true/false` 不一致计为失败。完整 checksum 节（expected/calculated hex 等）在 `checksum.actual` 中。
+- **通过率**：`(一致字段数 + 一致分支数 + 校验一致) / (基线字段数 + 新增字段数 + 基线分支数 + 新增分支数 + 1)`。任一差异存在则 `passed=false`。
+
+样例的查询与列表：
+
+```bash
+# 列出全部样例（可按设备类型过滤）
+curl 'http://localhost:8000/api/v1/fixtures?device_type=temp_sensor'
+
+# 查询单个样例（含基线快照）；名称在设备类型内唯一，故需 device_type 查询参数
+curl 'http://localhost:8000/api/v1/fixtures/temp-branch?device_type=temp_sensor'
+
+# 回归运行（基线版本）
+curl -X POST 'http://localhost:8000/api/v1/fixtures/temp-branch/run?device_type=temp_sensor'
+
+# 跨版本对比运行
+curl -X POST 'http://localhost:8000/api/v1/fixtures/temp-branch/run?device_type=temp_sensor' \
+  -H 'Content-Type: application/json' \
+  -d '{"target_version": "2.0.0"}'
+```
+
+> 样例同样保存在 SQLite（`fixtures` 表，`UNIQUE(device_type, name)`），随 `parser-data` 卷持久化；启动自动建表，已有数据库升级时也会自动补建新表。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -418,8 +521,9 @@ app/
   parser.py     # 按位解析器（位读取、条件分支、repeat 数组展开、校验和验证）
   encoder.py    # 按位编码器（位写入、scale/offset 反算、repeat 数组、校验和自动写入）
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
+  regression.py # 解析回归样例（基线快照捕获、字段/分支/校验差异比对、通过率计算）
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
-  database.py   # SQLite 持久化（启动自动建表）
+  database.py   # SQLite 持久化（definitions / fixtures 两表，启动自动建表）
 tests/test_api.py
 Dockerfile
 docker-compose.yml

@@ -72,6 +72,33 @@ class CompatibilityRequest(BaseModel):
     new_version: str = Field(min_length=1, max_length=64)
 
 
+class FixtureExpectedField(BaseModel):
+    # A single expected-field snapshot entry. Only `name` is required; an
+    # explicit `raw_value` pins the comparison baseline (repeated fields use a
+    # list), while bool/hex/ascii fields are compared via their parsed value.
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    raw_value: Optional[Any] = None
+
+
+class FixtureCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    device_type: str = Field(min_length=1, max_length=128)
+    version: Optional[str] = None  # omitted -> latest active version
+    hex: str = Field(min_length=2)
+    # When omitted, the whole baseline parse result is captured automatically.
+    expected_fields: Optional[List[FixtureExpectedField]] = None
+
+
+class FixtureRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_version: Optional[str] = None  # omitted -> the fixture's baseline version
+
+
 def validate_definition(defn: DefinitionCreate) -> None:
     """Cross-field semantic validation. Raises ValueError on problems."""
     if not defn.fields:
